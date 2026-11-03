@@ -154,6 +154,16 @@ class MediaLibraryController(
             }
         }
         if (cached >= 0) return cached
+        val active = cache.directory(cameraId).activeResumableSource(relative(cache.fileCache(cameraId, file)))
+        if (active != null) {
+            return try {
+                val count = minOf(active.length, QuickTimeKeys.TAIL_BYTES.toLong()).toInt()
+                val mode = ClipColorProfile.colorModeFromMp4(active.readRange(active.length - count, count))
+                withContext(Dispatchers.Main.immediate) {
+                    if (!operation.isCurrent()) -1 else { if (mode >= 0) rememberColor(file, mode, operation); mode }
+                }
+            } catch (error: Exception) { if (error is CancellationException) throw error; -1 }
+        }
         val storage = withContext(Dispatchers.Main.immediate) {
             if (operation.isCurrent() && isLive) resolvedStorage(file) else null
         } ?: return -1
@@ -221,13 +231,16 @@ class MediaLibraryController(
         val binding = library.binding ?: return null
         var attempted = false
         var submission: DjiAndroidMediaMutationSubmission? = null
-        return try { deletePocketCapturedContent(captured.asset.id,
+        val removed = try { deletePocketCapturedContent(captured.asset.id,
             admitted = { operation.isCurrent() && session.mediaConnectionIdentity == source && isLive &&
                 record(file)?.asset?.id == captured.asset.id &&
                 (!attempted || submission?.let(owner::isCurrent) == true) },
             send = { attempted = true; submission = owner.submitDeletion(captured.asset.id, binding) },
             remove = { dropFile(file, token); library.record(captured.asset.id) == null }) }
         catch (_: MediaServiceException) { note = MediaOperatorCopy.NOT_CONNECTED; null }
+        if (removed != null) for (path in MediaHTTP.proxyPaths(file) + file.path)
+            cache.directory(cameraId).discardPartial(relative(cache.playbackCache(cameraId, file, path)))
+        return removed
     }
 
     override suspend fun ensureThumbnail(file: MediaFile): Unit = withContext(Dispatchers.Main.immediate) {
@@ -268,15 +281,24 @@ class MediaLibraryController(
         if (isDownloaded(file)) { library.completeHostTransfer(operation.authority, MediaRepresentationRole.ORIGINAL); return@withContext }
         if (!isLive) { note = MediaOperatorCopy.CLIP_NOT_CACHED; return@withContext }
         try {
-            val destination = library.cacheHostFile(operation.authority, MonitorMediaLibraryIOPurpose.DOWNLOAD,
-                relative(cache.fileCache(cameraId, file)), transferPlan(file, MediaHTTP.deliveryPath(file), operation))
-                ?: return@withContext
+            val destination = if (file.kind != com.opencapture.opencine.vocabulary.MediaKind.PHOTO) {
+                try {
+                    val source = openProgressiveMedia(file, file.path, operation)
+                    try { source.complete() } finally { withContext(NonCancellable) { source.close() } }
+                } catch (error: MonitorMediaRangeException) {
+                    if (error.reason != "unsupported") throw error
+                    library.cacheHostFile(operation.authority, MonitorMediaLibraryIOPurpose.DOWNLOAD,
+                        relative(cache.fileCache(cameraId, file)), transferPlan(file, file.path, operation)) ?: return@withContext
+                }
+            } else library.cacheHostFile(operation.authority, MonitorMediaLibraryIOPurpose.DOWNLOAD,
+                relative(cache.fileCache(cameraId, file)), transferPlan(file, file.path, operation)) ?: return@withContext
             val mode = withContext(Dispatchers.IO) { ClipColorProfile.shotColorFromFile(destination, file.path) }
             if (!operation.isCurrent()) return@withContext
             if (mode >= 0) rememberColor(file, mode, operation)
             library.completeHostTransfer(operation.authority, MediaRepresentationRole.ORIGINAL)
         } catch (error: Exception) {
             if (error is CancellationException) throw error
+            if (error is MonitorMediaRangeException && error.reason == "retired") return@withContext
             library.clearHostProgress(operation.authority)
             if (operation.isCurrent()) note = MediaOperatorCopy.DOWNLOAD_FAILED
         }
@@ -337,13 +359,23 @@ class MediaLibraryController(
         return pocketPlaybackCandidates(file, live = isLive,
             cached = { path -> cache.existingFile(cache.playbackCache(cameraId, file, path)) },
             download = { path, role ->
-                MonitorPlaybackCandidate.HostDownload(
+                val fallback = MonitorPlaybackCandidate.HostDownload(
                     relative(cache.playbackCache(cameraId, file, path)), MediaHTTP.playbackMIMEType(path),
                     path, role, MonitorPlaybackAdmission(operation::isCurrent),
                     didCommit = {
                         if (operation.isCurrent()) library.completeHostTransfer(operation.authority, role)
                     },
                     transfer = { sink -> transferPlaybackFile(file, path, operation, sink) })
+                MonitorPlaybackCandidate.Progressive(fallback) {
+                    val destination = cache.playbackCache(cameraId, file, path)
+                    val existing = cache.existingFile(destination)
+                    if (existing != null) MonitorPlaybackItem(existing.toURI(), MediaHTTP.playbackMIMEType(path), path, role)
+                    else {
+                        val source = openProgressiveMedia(file, path, operation)
+                        MonitorPlaybackItem(destination.toURI(), MediaHTTP.playbackMIMEType(path), path, role,
+                            isRemote = true, byteSource = source)
+                    }
+                }
             })
     }
 
@@ -353,6 +385,38 @@ class MediaLibraryController(
         if (!admission.isCurrent()) return null
         return MonitorPlaybackLook(mode.takeIf { it >= 0 }?.let { MonitorTransfer.fromColorMode(it) },
             PocketPlaybackLook(mode))
+    }
+
+    private suspend fun openProgressiveMedia(file: MediaFile, path: String,
+        operation: PocketMediaOperation): MonitorRangePlaybackSource {
+        operation.requireCurrent()
+        val directory = cache.directory(cameraId)
+        val resources = httpSource.resources(path, resolvedStorage(file))
+        var last: Exception = MonitorMediaRangeException("invalid-response")
+        for (resource in resources) {
+            try {
+                val source = directory.resumableSource(relative(cache.playbackCache(cameraId, file, path)),
+                    "$cameraId|${resource.url}|${file.id}|${file.sizeBytes}|${file.filenameTimestamp}",
+                    file.sizeBytes.takeIf { path == file.path && it > 0 },
+                    admitted = { withContext(Dispatchers.Main.immediate) { operation.isCurrent() && isLive } },
+                    fetch = { range -> MediaTransfer.rangeResponse(resource.url, range) },
+                    committed = { withContext(Dispatchers.Main.immediate) {
+                        if (operation.isCurrent()) {
+                            library.refreshLocalCache()
+                            library.completeHostTransfer(operation.authority,
+                                if (path == file.path) MediaRepresentationRole.ORIGINAL else MediaRepresentationRole.PROXY)
+                        }
+                    } }, progress = { bytes, total -> withContext(Dispatchers.Main.immediate) {
+                        library.reportResumableProgress(operation.authority, bytes, total)
+                    } }, stopped = { withContext(Dispatchers.Main.immediate) { library.clearHostProgress(operation.authority) } })
+                httpSource.rememberStorage(resource.storage, file.path)
+                return source
+            } catch (error: Exception) {
+                if (error is CancellationException || error is MonitorMediaRangeException && error.reason == "unsupported") throw error
+                operation.requireCurrent(); last = error
+            }
+        }
+        throw last
     }
 
     private suspend fun transferPlaybackFile(file: MediaFile, path: String,

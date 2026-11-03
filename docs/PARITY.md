@@ -1,5 +1,26 @@
 # Operator parity
 
+## Development: resumable gallery playback
+
+Both shells opt into OpenCine positional byte sources: AVAssetResourceLoader on
+iOS and a Media3 DataSource on Android. Remote candidates can play while caching;
+missing proxies retain the existing original fallback. Range-capable sources
+prioritize the MP4 index and seek targets, then fill remaining holes. The complete
+file enters the original cache only after all byte ranges are present.
+
+Pause continues caching. Closing or changing clips stops progressive gallery
+transfers and retains checkpoints. Backgrounding suspends transfers; foreground
+restores caching while the existing scene policy prevents unsolicited playback.
+Reopening resumes only with a matching strong ETag or Last-Modified; without one,
+the new connection downloads afresh. Range refusal falls back to full download.
+Partial files cannot be shared as originals and are removed by cache cleanup or
+successful camera-content removal.
+
+**Unverified on both platforms:** no tests, builds or physical acceptance were
+performed, as requested for this task. This is a development integration, not a
+shipping parity claim. The development pin points to the paired AvalonWot fork
+commit; an upstream integration and release remain separate.
+
 iOS is the operator-proven baseline. Android matches operator-visible behavior
 unless a row lists an exception. GPU backends, Bluetooth stacks, and OS APIs may
 diverge. Shipping a one-platform operator-visible change without a row here is

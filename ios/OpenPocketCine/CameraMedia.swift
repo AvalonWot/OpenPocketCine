@@ -67,6 +67,13 @@ final class CameraMedia {
         cfg.timeoutIntervalForResource = 600
         return MonitorMediaHTTPStream(configuration: cfg)
     }()
+    private(set) lazy var rangeHTTP: MonitorMediaRangeHTTP = {
+        let cfg = httpConfiguration.copy() as! URLSessionConfiguration
+        cfg.allowsCellularAccess = false; cfg.waitsForConnectivity = false
+        cfg.timeoutIntervalForRequest = 30; cfg.timeoutIntervalForResource = 60
+        cfg.urlCache = nil; cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return MonitorMediaRangeHTTP(configuration: cfg)
+    }()
 
     func cancelResumeLive() { returnSession.cancel() }
 
@@ -511,9 +518,25 @@ extension CameraSession {
         guard canReachCameraMedia else { mediaNote = MediaOperatorCopy.clipNotCached; return }
         let destination = cameraMedia.fileCacheURL(cameraID: operation.cameraID, file: file)
         do {
-            guard let location = try await operation.library.cacheHostFile(operation.authority,
-                purpose: .download, at: try mediaCacheAddress(destination, operation: operation),
-                plan: mediaTransferPlan(file: file, path: MediaHTTP.deliveryPath(file), operation: operation)) else { return }
+            let location: URL
+            if file.kind != .photo {
+                do {
+                    let source = try await openProgressiveMedia(file: file, path: file.path)
+                    do { location = try await source.complete() }
+                    catch { await source.close(); throw error }
+                    await source.close()
+                } catch MonitorMediaRangeError.unsupported {
+                    guard let value = try await operation.library.cacheHostFile(operation.authority,
+                        purpose: .download, at: try mediaCacheAddress(destination, operation: operation),
+                        plan: mediaTransferPlan(file: file, path: file.path, operation: operation)) else { return }
+                    location = value
+                }
+            } else {
+                guard let value = try await operation.library.cacheHostFile(operation.authority,
+                    purpose: .download, at: try mediaCacheAddress(destination, operation: operation),
+                    plan: mediaTransferPlan(file: file, path: file.path, operation: operation)) else { return }
+                location = value
+            }
             try operation.requireCurrent()
             if let mode = ClipColorProfile.shotColor(at: location, path: file.path) {
                 rememberShotColor(mode, for: file, operation: operation)
@@ -521,6 +544,8 @@ extension CameraSession {
             operation.library.completeHostTransfer(operation.authority, role: .original)
         } catch {
             guard operation.isCurrent else { return }
+            if error is CancellationError { return }
+            if case MonitorMediaRangeError.retired = error { return }
             operation.library.clearHostProgress(operation.authority)
             mediaNote = MediaOperatorCopy.downloadFailed
             ControlLiveLog.line("media: download failed \(file.filename) \(error.localizedDescription)")
@@ -543,6 +568,19 @@ extension CameraSession {
         }
         if let cached = shotColor(for: file) { return cached }
         guard canReachCameraMedia else { return nil }
+        let address = try? mediaCacheAddress(cameraMedia.fileCacheURL(cameraID: operation.cameraID, file: file), operation: operation)
+        if let address, let source = try? await operation.directory.activeResumableSource(at: address) {
+            do {
+                let count = Int(min(source.length, Int64(ClipColorProfile.fileTailBytes)))
+                let data = try await source.readRange(offset: source.length - Int64(count), count: count)
+                try operation.requireCurrent()
+                if let mode = ClipColorProfile.colorMode(fromMP4: data) {
+                    rememberShotColor(mode, for: file, operation: operation)
+                    return mode
+                }
+            } catch { return nil }
+            return nil
+        }
         let range = ClipColorProfile.httpRange(fileSize: file.sizeBytes)
         let first = cameraMedia.resolvedStorage(for: file, singleSd: usesSingleSdStorage)
         let second = first == 0 ? 1 : 0
@@ -725,6 +763,42 @@ extension CameraSession {
         return receipt
     }
 
+    /// Same owner for playback, full-resolution caching and explicit download.
+    func openProgressiveMedia(file: MediaFile, path: String,
+        authority: PocketPlaybackAuthority? = nil) async throws -> MonitorRangePlaybackSource {
+        let operation = authority?.operation ?? PocketMediaLibraryOperation(session: self, file: file)
+        try operation.requireCurrent()
+        let destination = cameraMedia.playbackCacheURL(cameraID: operation.cameraID, file: file, path: path)
+        let address = try mediaCacheAddress(destination, operation: operation)
+        let transport = cameraMedia.rangeHTTP
+        let first = cameraMedia.resolvedStorage(for: file, singleSd: usesSingleSdStorage)
+        let resources = cameraMedia.httpSource.resources(path: path, firstStorage: first)
+        var last: any Error = MonitorMediaRangeError.invalidResponse
+        for resource in resources {
+            try Task.checkCancellation()
+            do {
+                let source = try await operation.directory.resumableSource(address: address,
+                    identity: "\(operation.cameraID)|\(resource.url.absoluteString)|\(file.id)|\(file.sizeBytes)|\(file.filenameTimestamp ?? "")",
+                    expected: path == file.path && file.sizeBytes > 0 ? Int64(exactly: file.sizeBytes) : nil,
+                    admitted: { [weak self] in
+                        operation.isCurrent && operation.canWriteWire && self?.canReachCameraMedia == true
+                            && (authority?.admission.isCurrent() ?? true)
+                    }, fetch: { range in try await transport.read(url: resource.url, range: range) },
+                    committed: {
+                        guard operation.isCurrent else { return }
+                        operation.library.refreshLocalCache()
+                        operation.library.completeHostTransfer(operation.authority, role: path == file.path ? .original : .proxy)
+                    }, progress: { bytes, total in
+                        operation.library.reportResumableProgress(operation.authority, bytes: bytes, total: total)
+                    }, stopped: { operation.library.clearHostProgress(operation.authority) })
+                cameraMedia.rememberStorage(resource.storage, for: file.path)
+                return source
+            } catch MonitorMediaRangeError.unsupported { throw MonitorMediaRangeError.unsupported }
+            catch { try operation.requireCurrent(); last = error }
+        }
+        throw last
+    }
+
     func playbackTransferCommitted(file: MediaFile, path: String, authority: PocketPlaybackAuthority) {
         let operation = authority.operation
         guard operation.isCurrent, authority.admission.isCurrent() else { return }
@@ -771,6 +845,12 @@ extension CameraSession {
         let ids = Set(library.records.filter { $0.payload.path == file.path }.map(\.asset.id))
         try? library.applyLocalRemoval(ids, token: token)
         if library.isCurrent(token) { library.clearHostProgress(operation.authority) }
+        for path in MediaHTTP.proxyPaths(file) + [file.path] {
+            let destination = cameraMedia.playbackCacheURL(cameraID: operation.cameraID, file: file, path: path)
+            if let address = try? mediaCacheAddress(destination, operation: operation) {
+                await operation.directory.discardPartial(at: address)
+            }
+        }
     }
 
     func toggleMediaFavorite(_ file: MediaFile) {

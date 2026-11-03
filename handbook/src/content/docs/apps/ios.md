@@ -7,6 +7,13 @@ The production iOS app is a universal iPhone and iPad SwiftUI shell in
 `ios/OpenPocketCine/`. It is the operator-proven datalink. Generate the Xcode
 project with XcodeGen — see [Setup](../../guides/setup/).
 
+## Development gallery playback
+
+Development gallery playback can download and cache a movie while playing it,
+with validated resume and priority fetching after a seek. See
+[progressive playback](../../protocol/media/#development-progressive-playback-and-resume).
+This addition has no build, test or physical validation yet.
+
 ## Cameras and pairing
 
 The cameras page and pairing flow use the shared OpenCine shell. Select a nearby

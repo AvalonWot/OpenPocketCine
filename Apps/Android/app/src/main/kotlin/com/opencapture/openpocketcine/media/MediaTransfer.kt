@@ -18,6 +18,40 @@ import okhttp3.Response
 /** Actual HTTP socket construction. The native runtime owns bounded copying, cancellation and
  * completion at an observed length; the integration owns storage candidates and retry. */
 object MediaTransfer {
+    suspend fun rangeResponse(url: String, range: com.opencapture.opencine.media.MonitorMediaRangeRequest):
+        com.opencapture.opencine.media.MonitorMediaRangeResponse = kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
+        val call = client.newCall(Request.Builder().url(url)
+            .header("Range", "bytes=${range.offset}-${range.offset + range.count - 1}")
+            .header("Accept-Encoding", "identity")
+            .apply { range.validator?.let { header("If-Range", it) } }.get().build())
+        continuation.invokeOnCancellation { call.cancel() }
+        call.enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, error: IOException) { continuation.resumeWith(Result.failure(error)) }
+            override fun onResponse(call: okhttp3.Call, response: Response) {
+                try {
+                    response.use {
+                        val bytes = if (it.code == 206) {
+                            val body = it.body ?: throw IOException("Missing Range body")
+                            if (body.contentLength() > range.count) throw IOException("Oversized Range body")
+                            val output = ByteArrayOutputStream()
+                            body.byteStream().use { input ->
+                                val buffer = ByteArray(65536)
+                                while (true) {
+                                    val count = input.read(buffer)
+                                    if (count < 0) break
+                                    if (output.size() > range.count - count) throw IOException("Oversized Range body")
+                                    output.write(buffer, 0, count)
+                                }
+                            }
+                            output.toByteArray()
+                        } else ByteArray(0)
+                        continuation.resumeWith(Result.success(com.opencapture.opencine.media.MonitorMediaRangeResponse(
+                            it.code, it.header("Content-Range"), it.header("ETag"), it.header("Last-Modified"), bytes)))
+                    }
+                } catch (error: Exception) { continuation.resumeWith(Result.failure(error)) }
+            }
+        })
+    }
     const val MAX_RAM_BYTES: Long = 8L * 1024 * 1024
     private val client: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS)

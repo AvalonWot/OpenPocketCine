@@ -7,6 +7,26 @@ Once the phone is on the camera [SoftAP](../wifi/), stills and clips are fetched
 
 ## File fetch
 
+### Development: progressive playback and resume
+
+The development gallery integration on iOS and Android requests byte ranges from
+`/v2`, caches the responses, and serves them to the native player. It can fetch a
+trailing MP4 index or a seek target before the rest of the movie. Clips without a
+usable proxy, including applicable slow-motion takes, use the original movie.
+Complete downloads remain available through the existing original-file cache.
+
+Pausing continues caching. Closing or changing the clip retains partial data for
+later use; moving the app to the background suspends downloading. Resume across
+connections or app restarts requires the camera's matching strong ETag or
+Last-Modified and a matching length. Without reliable validation, downloading
+starts again. A camera ignoring Range uses the complete-download fallback.
+Partial data is not a complete original and cannot be exported as one.
+
+This development implementation has not been tested, built or validated on a
+physical camera/device. It is not a claim about an already released app version.
+
+### Endpoint
+
 ```text
 GET http://192.168.2.1/v2?storage={0|1}&path=
 ```

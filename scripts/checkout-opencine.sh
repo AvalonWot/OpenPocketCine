@@ -1,7 +1,7 @@
 #!/bin/sh
 # Check out each repository named in opencine-pins.txt next to this app
 # (../<Name>) at its exact commit, then verify the commit. Never follows a branch.
-# Usage: scripts/checkout-opencine.sh [base-url]   (default https://github.com/erik-sutton95)
+# Usage: scripts/checkout-opencine.sh [base-url]   (default https://github.com/AvalonWot)
 #
 # This file is the bootstrap, so the app keeps its own copy: it runs before the
 # pin exists. Keep it identical to OpenCine/scripts/checkout-opencine.sh.
@@ -15,7 +15,7 @@ if [ -f "$canon" ]; then
     exit 1
   fi
 fi
-base=${1:-https://github.com/erik-sutton95}
+base=${1:-https://github.com/AvalonWot}
 grep -v '^#' "$root/opencine-pins.txt" | while read -r name sha; do
   [ -n "$name" ] || continue
   dest="$root/../$name"

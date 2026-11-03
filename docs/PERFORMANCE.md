@@ -1,5 +1,26 @@
 # Live performance budgets
 
+## Development: progressive gallery playback
+
+The optional iOS/Android gallery source uses one 1 MiB Range request per file at
+a time. Missing player ranges, including a trailing MP4 index and seek targets,
+take priority over sequential cache fill. Superseded reads can cancel a pending
+request. HTTP bodies are bounded before entering memory; a server returning 200
+to Range is stopped at its headers and uses the previous full-download path.
+There is no transcode, second decoder, extra frame tap or live-enable command.
+
+Sparse writes and checkpoints run away from the main thread. Only fsynced ranges
+are marked available. Playback, metadata reads and full-resolution caching share
+an active original source. Completion renames the same file without replacing the
+player item. Cache usage includes temporary files; sparse file sizes may represent
+logical length rather than physically allocated storage.
+
+Status: implementation only, with no tests, builds, performance measurements or
+physical validation. The existing playback rendering budgets still apply; no
+first-frame latency, memory or thermal result is claimed.
+
+## Existing live budgets
+
 The picture is the product. Chrome, scopes, and SET traffic ride around it.
 Target hardware is mid/high-end: iPhone 13-class and newer; Android API 33+
 with ≥4 GB RAM. Prove **physical** after any live-path

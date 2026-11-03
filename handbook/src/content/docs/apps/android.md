@@ -16,6 +16,13 @@ options → Save diagnostic report**. Local VPNs and ad blockers (AdGuard, Bloka
 RethinkDNS) can block the UDP live feed after Wi-Fi joins — pause them or
 exclude this app ([Troubleshooting](../../guides/troubleshooting/)).
 
+## Development gallery playback
+
+Development gallery playback can download and cache a movie while playing it,
+with validated resume and priority fetching after a seek. See
+[progressive playback](../../protocol/media/#development-progressive-playback-and-resume).
+This addition has no build, test or physical validation yet.
+
 ## Before pairing
 
 Before pairing, turn off DJI Frame Tap and force quit DJI Mimo. Frame Tap blocks

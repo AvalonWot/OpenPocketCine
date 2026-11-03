@@ -101,7 +101,7 @@ struct PocketPlaybackLook: Equatable, Sendable {
                 cameraID: authority.operation.cameraID, file: file, path: path)
             let prefix = authority.operation.directory.root.path + "/"
             let address = String(destination.path.dropFirst(prefix.count))
-            return .hostDownload(
+            let fallback = MonitorPlaybackCandidate.hostDownload(
                 address: address, mimeType: MediaHTTP.playbackMIMEType(for: path),
                 sourceKey: path, role: path == file.path ? .original : .proxy,
                 admission: .init { [weak self] in
@@ -116,9 +116,20 @@ struct PocketPlaybackLook: Equatable, Sendable {
                     return try await self.transferPlaybackFile(
                         file: file, path: path, authority: authority, into: sink)
                 })
+            return .progressive(fallback: fallback, open: { [weak self] in
+                guard let self, authority.admission.isCurrent() else { throw MonitorPlaybackError.retired }
+                if let existing = authority.operation.directory.existing(address) {
+                    return .init(url: existing, mimeType: MediaHTTP.playbackMIMEType(for: path), sourceKey: path,
+                        role: path == file.path ? .original : .proxy)
+                }
+                let source = try await self.openProgressiveMedia(file: file, path: path, authority: authority)
+                return .init(url: destination, mimeType: MediaHTTP.playbackMIMEType(for: path), sourceKey: path,
+                    role: path == file.path ? .original : .proxy, isRemote: true, byteSource: source)
+            })
         }
         // Monitor-grade proxy first, even when export has cached the high-resolution original.
-        // The shared owner retries each native candidate with the original eight-second deadline.
+        // Local/full-download items retain the existing readiness deadline; progressive
+        // reads use the bounded range worker's timeout and retry policy.
         if let proxy = localProxySource(for: file) { choices.append(cached(proxy)) }
         if canReachCameraMedia { choices += MediaHTTP.proxyPaths(file).map(remote) }
         if let local = localPlaybackSource(for: file) { choices.append(cached(local)) }
